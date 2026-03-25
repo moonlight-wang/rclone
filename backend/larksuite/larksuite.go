@@ -379,13 +379,13 @@ func (f *Fs) listFiles(ctx context.Context, folderToken string) ([]api.File, err
 	pageToken := ""
 
 	for {
-		url := apiBaseURL + "/drive/v1/files?folder_token=" + url.QueryEscape(folderToken)
+		apiURL := apiBaseURL + "/drive/v1/files?folder_token=" + url.QueryEscape(folderToken)
 		if pageToken != "" {
-			url += "&page_token=" + url.QueryEscape(pageToken)
+			apiURL += "&page_token=" + url.QueryEscape(pageToken)
 		}
 
 		var resp api.FileListResponse
-		err := f.callAPI(ctx, "GET", url, nil, &resp)
+		err := f.callAPI(ctx, "GET", apiURL, nil, &resp)
 		if err != nil {
 			return nil, err
 		}
@@ -491,6 +491,12 @@ func (f *Fs) Put(ctx context.Context, in io.Reader, src fs.ObjectInfo, options .
 	default:
 		return nil, err
 	}
+}
+
+// PutUnchecked uploads the object without checking if it exists
+func (f *Fs) PutUnchecked(ctx context.Context, in io.Reader, src fs.ObjectInfo, options ...fs.OpenOption) (fs.Object, error) {
+	remote := src.Remote()
+	return f.putUnchecked(ctx, in, src, remote, options...)
 }
 
 // putUnchecked uploads the object without checking if it exists
