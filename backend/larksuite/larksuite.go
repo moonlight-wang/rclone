@@ -52,12 +52,12 @@ func init() {
 				return fs.ConfigError("", "App ID and App Secret are required")
 			}
 
-			// Test the credentials by getting a tenant access token
+			// Test the credentials by getting an app access token
 			tempFs := &Fs{
 				opt: *opt,
 			}
 			tempFs.httpClient = fshttp.NewClient(ctx)
-			_, err = tempFs.getTenantAccessToken(ctx)
+			_, err = tempFs.getAccessToken(ctx)
 			if err != nil {
 				return fs.ConfigError("", fmt.Sprintf("Failed to authenticate: %v", err))
 			}
@@ -79,6 +79,11 @@ func init() {
 			Advanced: true,
 			Default:  "",
 		}, {
+			Name:     "collaborator_email",
+			Help:     "Email of collaborator to add with edit permission\nExample: wangxianji82@gmail.com",
+			Advanced: true,
+			Default:  "",
+		}, {
 			Name:     config.ConfigEncoding,
 			Help:     config.ConfigEncodingHelp,
 			Advanced: true,
@@ -91,10 +96,11 @@ func init() {
 
 // Options defines the configuration for this backend
 type Options struct {
-	AppID        string               `config:"app_id"`
-	AppSecret    string               `config:"app_secret"`
-	RootFolderID string               `config:"root_folder_id"`
-	Enc          encoder.MultiEncoder `config:"encoding"`
+	AppID             string               `config:"app_id"`
+	AppSecret         string               `config:"app_secret"`
+	RootFolderID      string               `config:"root_folder_id"`
+	CollaboratorEmail string               `config:"collaborator_email"`
+	Enc               encoder.MultiEncoder `config:"encoding"`
 }
 
 // Fs represents a remote LarkSuite Drive server
@@ -184,10 +190,15 @@ func NewFs(ctx context.Context, name, root string, m configmap.Mapper) (fs.Fs, e
 		ReadMimeType:            true,
 	}).Fill(ctx, f)
 
-	// Set up dir cache
+	// Get root folder token if not provided
 	rootID := opt.RootFolderID
 	if rootID == "" {
-		rootID = "0" // Use "0" as special root identifier
+		// Get the actual root folder token from API
+		token, err := f.getRootFolderToken(ctx)
+		if err != nil {
+			return nil, fmt.Errorf("failed to get root folder token: %w", err)
+		}
+		rootID = token
 	}
 	f.dirCache = dircache.New(root, rootID, f)
 
@@ -218,14 +229,9 @@ func NewFs(ctx context.Context, name, root string, m configmap.Mapper) (fs.Fs, e
 	return f, nil
 }
 
-// getTenantAccessToken gets a tenant access token for app authentication
-func (f *Fs) getTenantAccessToken(ctx context.Context) (string, error) {
-	// Check if we have a valid cached token
-	if f.token != "" && time.Now().Before(f.tokenExpiry) {
-		return f.token, nil
-	}
-
-	url := apiBaseURL + "/auth/v3/tenant_access_token/internal"
+// getAppAccessToken gets an app access token
+func (f *Fs) getAppAccessToken(ctx context.Context) (string, error) {
+	url := apiBaseURL + "/auth/v3/app_access_token/internal"
 	payload := fmt.Sprintf(`{"app_id":"%s","app_secret":"%s"}`, f.opt.AppID, f.opt.AppSecret)
 
 	req, err := http.NewRequestWithContext(ctx, "POST", url, strings.NewReader(payload))
@@ -234,7 +240,7 @@ func (f *Fs) getTenantAccessToken(ctx context.Context) (string, error) {
 	}
 	req.Header.Set("Content-Type", "application/json")
 
-	var resp api.TenantAccessTokenResponse
+	var resp api.AppAccessTokenResponse
 	err = f.pacer.Call(func() (bool, error) {
 		res, err := f.httpClient.Do(req)
 		if err != nil {
@@ -251,7 +257,6 @@ func (f *Fs) getTenantAccessToken(ctx context.Context) (string, error) {
 			return false, err
 		}
 
-		// Parse response
 		if err := json.Unmarshal(body, &resp); err != nil {
 			return false, err
 		}
@@ -267,14 +272,133 @@ func (f *Fs) getTenantAccessToken(ctx context.Context) (string, error) {
 		return "", err
 	}
 
-	f.token = resp.TenantAccessToken
+	return resp.AppAccessToken, nil
+}
+
+// getLoginToken gets a login token (temporary authorization code) for login-free auth
+func (f *Fs) getLoginToken(ctx context.Context) (string, error) {
+	// Get app access token first
+	appToken, err := f.getAppAccessToken(ctx)
+	if err != nil {
+		return "", fmt.Errorf("failed to get app access token: %w", err)
+	}
+
+	url := apiBaseURL + "/authen/v1/index"
+
+	req, err := http.NewRequestWithContext(ctx, "GET", url, nil)
+	if err != nil {
+		return "", err
+	}
+	req.Header.Set("Authorization", "Bearer "+appToken)
+
+	var resp api.LoginTokenResponse
+	err = f.pacer.Call(func() (bool, error) {
+		res, err := f.httpClient.Do(req)
+		if err != nil {
+			return true, err
+		}
+		defer res.Body.Close()
+
+		if res.StatusCode >= 500 {
+			return true, fmt.Errorf("server error: %d", res.StatusCode)
+		}
+
+		body, err := io.ReadAll(res.Body)
+		if err != nil {
+			return false, err
+		}
+
+		if err := json.Unmarshal(body, &resp); err != nil {
+			return false, err
+		}
+
+		if resp.Code != 0 {
+			return false, fmt.Errorf("API error: %s", resp.Msg)
+		}
+
+		return false, nil
+	})
+
+	if err != nil {
+		return "", err
+	}
+
+	return resp.Data.Code, nil
+}
+
+// getAccessToken gets an app access token for API authentication
+func (f *Fs) getAccessToken(ctx context.Context) (string, error) {
+	// Check if we have a valid cached token
+	if f.token != "" && time.Now().Before(f.tokenExpiry) {
+		return f.token, nil
+	}
+
+	url := apiBaseURL + "/auth/v3/app_access_token/internal"
+	payload := fmt.Sprintf(`{"app_id":"%s","app_secret":"%s"}`, f.opt.AppID, f.opt.AppSecret)
+
+	req, err := http.NewRequestWithContext(ctx, "POST", url, strings.NewReader(payload))
+	if err != nil {
+		return "", err
+	}
+	req.Header.Set("Content-Type", "application/json")
+
+	var resp api.AppAccessTokenResponse
+	err = f.pacer.Call(func() (bool, error) {
+		res, err := f.httpClient.Do(req)
+		if err != nil {
+			return true, err
+		}
+		defer res.Body.Close()
+
+		if res.StatusCode >= 500 {
+			return true, fmt.Errorf("server error: %d", res.StatusCode)
+		}
+
+		body, err := io.ReadAll(res.Body)
+		if err != nil {
+			return false, err
+		}
+
+		if err := json.Unmarshal(body, &resp); err != nil {
+			return false, err
+		}
+
+		if resp.Code != 0 {
+			return false, fmt.Errorf("API error: %s", resp.Msg)
+		}
+
+		return false, nil
+	})
+
+	if err != nil {
+		return "", err
+	}
+
+	f.token = resp.AppAccessToken
 	f.tokenExpiry = time.Now().Add(time.Duration(resp.Expire-60) * time.Second) // Refresh 1 minute before expiry
 	return f.token, nil
 }
 
+// getRootFolderToken gets the root folder token for the user
+func (f *Fs) getRootFolderToken(ctx context.Context) (string, error) {
+	apiURL := apiBaseURL + "/drive/explorer/v2/root_folder/meta"
+
+	var resp api.RootFolderResponse
+	err := f.callAPI(ctx, "GET", apiURL, nil, &resp)
+	if err != nil {
+		return "", err
+	}
+
+	if resp.Code != 0 {
+		return "", fmt.Errorf("failed to get root folder: %s", resp.Msg)
+	}
+
+	return resp.Data.Token, nil
+}
+
 // callAPI makes an authenticated API call
 func (f *Fs) callAPI(ctx context.Context, method, url string, body io.Reader, result interface{}) error {
-	token, err := f.getTenantAccessToken(ctx)
+	token, err := f.getAccessToken(ctx)
 	if err != nil {
 		return err
 	}
@@ -346,13 +470,19 @@ func (f *Fs) FindLeaf(ctx context.Context, pathID, leaf string) (string, bool, e
 func (f *Fs) CreateDir(ctx context.Context, pathID, leaf string) (string, error) {
 	url := apiBaseURL + "/drive/v1/files/create_folder"
 
-	reqBody := api.CreateFolderRequest{
-		Name:        f.opt.Enc.FromStandardName(leaf),
-		ParentToken: pathID,
+	// Get root folder token if pathID is empty or "0"
+	parentToken := pathID
+	if parentToken == "" || parentToken == "0" {
+		rootToken, err := f.getRootFolderToken(ctx)
+		if err != nil {
+			return "", fmt.Errorf("failed to get root folder token: %w", err)
+		}
+		parentToken = rootToken
 	}
 
-	if pathID == "0" {
-		reqBody.ParentToken = ""
+	reqBody := api.CreateFolderRequest{
+		Name:        f.opt.Enc.FromStandardName(leaf),
+		FolderToken: parentToken,
 	}
 
 	jsonBody, err := json.Marshal(reqBody)
@@ -370,6 +500,15 @@ func (f *Fs) CreateDir(ctx context.Context, pathID, leaf string) (string, error)
 		return "", fmt.Errorf("failed to create folder: %s", resp.Msg)
 	}
 
+	// Add collaborator if configured
+	if f.opt.CollaboratorEmail != "" {
+		err = f.AddCollaborator(ctx, resp.Data.Token, f.opt.CollaboratorEmail)
+		if err != nil {
+			fs.Logf(f, "Failed to add collaborator %s to folder %s: %v", f.opt.CollaboratorEmail, leaf, err)
+			// Don't fail the folder creation if adding collaborator fails
+		}
+	}
+
 	return resp.Data.Token, nil
 }
 
@@ -379,7 +518,13 @@ func (f *Fs) listFiles(ctx context.Context, folderToken string) ([]api.File, err
 	pageToken := ""
 
 	for {
-		apiURL := apiBaseURL + "/drive/v1/files?folder_token=" + url.QueryEscape(folderToken)
+		var apiURL string
+		if folderToken != "" {
+			apiURL = apiBaseURL + "/drive/v1/files?folder_token=" + url.QueryEscape(folderToken)
+		} else {
+			// For root folder, use the root API endpoint
+			apiURL = apiBaseURL + "/drive/v1/files"
+		}
 		if pageToken != "" {
 			apiURL += "&page_token=" + url.QueryEscape(pageToken)
 		}
@@ -421,7 +566,7 @@ func (f *Fs) List(ctx context.Context, dir string) (entries fs.DirEntries, err e
 		remote := path.Join(dir, f.opt.Enc.ToStandardName(file.Name))
 		if file.IsDir() {
 			f.dirCache.Put(remote, file.Token)
-			d := fs.NewDir(remote, file.ModifiedTime)
+			d := fs.NewDir(remote, file.ModifiedTime.Time())
 			entries = append(entries, d)
 		} else {
 			o, err := f.newObjectWithInfo(ctx, remote, &file)
@@ -474,7 +619,7 @@ func (f *Fs) newObjectWithInfo(ctx context.Context, remote string, info *api.Fil
 		remote:   remote,
 		token:    info.Token,
 		size:     info.Size,
-		modTime:  info.ModifiedTime,
+		modTime:  info.ModifiedTime.Time(),
 		mimeType: info.MimeType,
 	}
 	return o, nil
@@ -520,7 +665,7 @@ func (f *Fs) uploadSimple(ctx context.Context, in io.Reader, name, parentID stri
 	// Implementation for simple upload using LarkSuite's upload API
 	url := apiBaseURL + "/drive/v1/files/upload_all"
 
-	token, err := f.getTenantAccessToken(ctx)
+	token, err := f.getAccessToken(ctx)
 	if err != nil {
 		return nil, err
 	}
@@ -545,8 +690,22 @@ func (f *Fs) uploadSimple(ctx context.Context, in io.Reader, name, parentID stri
 		return nil, err
 	}
 
-	// Add parent token
-	err = writer.WriteField("parent_token", parentID)
+	// Add parent_type (required for upload API)
+	err = writer.WriteField("parent_type", "explorer")
+	if err != nil {
+		return nil, err
+	}
+
+	// Add folder token (parent_node is the correct parameter name for upload API)
+	if parentID != "" && parentID != "0" {
+		err = writer.WriteField("parent_node", parentID)
+		if err != nil {
+			return nil, err
+		}
+	}
+
+	// Add file_name parameter
+	err = writer.WriteField("file_name", f.opt.Enc.FromStandardName(name))
 	if err != nil {
 		return nil, err
 	}
@@ -604,7 +763,7 @@ func (f *Fs) uploadSimple(ctx context.Context, in io.Reader, name, parentID stri
 		ParentToken:  parentID,
 		Size:         resp.Data.Size,
 		MimeType:     resp.Data.MimeType,
-		ModifiedTime: modTime,
+		ModifiedTime: api.UnixTime(modTime),
 	}
 
 	// Build the remote path from the current root and file name
@@ -788,7 +947,7 @@ func (o *Object) Open(ctx context.Context, options ...fs.OpenOption) (io.ReadClo
 		return nil, err
 	}
 
-	token, err := o.fs.getTenantAccessToken(ctx)
+	token, err := o.fs.getAccessToken(ctx)
 	if err != nil {
 		return nil, err
 	}
@@ -836,6 +995,30 @@ func (o *Object) Update(ctx context.Context, in io.Reader, src fs.ObjectInfo, op
 func (o *Object) Remove(ctx context.Context) error {
 	url := apiBaseURL + "/drive/v1/files/" + o.token
 	return o.fs.callAPI(ctx, "DELETE", url, nil, nil)
+}
+
+// AddCollaborator adds a collaborator to a file or folder with edit permission
+func (f *Fs) AddCollaborator(ctx context.Context, token string, email string) error {
+	// Add type=folder query parameter
+	url := apiBaseURL + "/drive/v1/permissions/" + token + "/members?type=folder"
+
+	reqBody := api.CollaboratorRequest{
+		Members: []api.Member{
+			{
+				MemberID:   email,
+				MemberType: "email",
+				Perm:       "edit", // edit permission allows invite
+			},
+		},
+	}
+
+	payload, err := json.Marshal(reqBody)
+	if err != nil {
+		return err
+	}
+
+	var resp api.CollaboratorResponse
+	return f.callAPI(ctx, "POST", url, bytes.NewReader(payload), &resp)
 }
 
 // Check the interfaces are satisfied
